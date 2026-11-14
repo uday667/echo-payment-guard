@@ -4,10 +4,12 @@ import org.flywaydb.core.Flyway;
 import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 import javax.sql.DataSource;
 
 @Configuration
+@EnableScheduling
 public class FlywayMigrationConfiguration {
     @Bean(initMethod = "migrate")
     Flyway flyway(DataSource dataSource) {

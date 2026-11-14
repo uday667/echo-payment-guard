@@ -1,0 +1,27 @@
+spring:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: echo-payment-guard
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+echo:
+  stream:
+    kafka:
+      enabled: ${PAYMENT_KAFKA_ENABLED:false}
+    window: ${PAYMENT_WINDOW:10m}
+    rapid-repeat-threshold: ${PAYMENT_RAPID_REPEAT_THRESHOLD:5}
+    event-id-retention: ${PAYMENT_EVENT_ID_RETENTION:90d}
+    cleanup-interval: ${PAYMENT_EVENT_CLEANUP_INTERVAL:3600000}
+    listener:
+      retry-delay: ${PAYMENT_KAFKA_RETRY_DELAY:1s}

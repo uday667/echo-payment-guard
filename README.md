@@ -1,13 +1,13 @@
-# Project Echo — Payment Guard (Task 1)
+# Project Echo — Payment Guard
 
-This repository implements **Task 1** and the investigator-alert portion of **Task 3**: a REST payment intake API with database-enforced idempotency, one-time key-reuse alerts, a paginated/masked alert query, and audited alert status changes. It uses a local, file-backed **H2 database in native H2 mode**. No external database, database application, or Docker is required.
-
-Task 2 (Kafka/Redis replay handling and stream duplicate detection) is not implemented. Docker Compose orchestration for Kafka/Redis is therefore not included.
+This repository implements **Task 1**, the Kafka/Redis stream portion of **Task 2**, and the investigator-alert portion of **Task 3**. It provides database-enforced REST idempotency, Kafka event intake, Redis event-time duplicate detection, paginated/masked alerts, and audited alert status changes. H2 is the database for local runs; no external database application is needed.
 
 ## Requirements
 
 - Java 17 or newer
 - The Maven wrapper included in this repository (`mvnw` / `mvnw.cmd`)
+- Python 3 and Docker Compose are optional and only needed for Task 2 stream generation/replay
+- Python 3 and Docker Compose are optional and only needed for Task 2 stream generation/replay
 
 No separate H2 installation is needed; H2 is included as an application dependency. Maven's offline test command works once the wrapper and project dependencies are available in the local Maven cache.
 
@@ -21,6 +21,10 @@ HTTP
        -> payments
        -> alerts (at most one mismatch alert per key)
   -> repositories -> H2
+Kafka payments.incoming -> same intake service -> H2 event receipts
+                                      -> Redis Lua sliding windows
+                                      -> NEAR_DUPLICATE / RAPID_REPEAT alerts
+Malformed Kafka messages -> bounded retries -> payments.incoming.DLT
 
 GET /api/alerts -> newest-first paginated query -> DTO masks account values
 PATCH /api/alerts/{id} -> atomic OPEN transition + alert_audit insert
@@ -33,11 +37,11 @@ Java classes are separated under `com.echo.paymentguard`:
 | Package | Responsibility |
 |---|---|
 | `controller` | REST routes and HTTP response mapping |
-| `service` | Payment intake, idempotency, fingerprints, alert query and audited transitions |
+| `service` | Payment intake, event replay handling, Redis windows, alerts and audited transitions |
 | `repository` | Spring Data persistence interfaces and atomic alert transition |
 | `model` | JPA entities, including append-only alert audit rows |
 | `dto` | API request/response types |
-| `config` | Flyway initialization |
+| `config` | Flyway initialization and Kafka topics/retries |
 | `exception` | API error handling |
 | `util` | Account-number masking |
 
@@ -49,7 +53,7 @@ The SHA-256 fingerprint is built from length-prefixed UTF-8 values for these bus
 
 Full account values are persisted in H2 and are not included in payment responses or application-generated log messages. Alert DTOs mask every account value, showing only its last four digits (for example, `XXXXXXXX4444`). The H2 database file itself contains the persisted account values; protect that file as database data.
 
-### Alert query index
+### Alert query indexes
 
 Flyway creates `idx_alerts_status_created_at` over `(status, created_at DESC)` to serve status-filtered, newest-first alert listings. It also creates `idx_alerts_type_status_created_at` over `(type, status, created_at DESC)` to support requests filtering by both type and status, and `idx_alert_audit_alert_id_at` over `(alert_id, at)` to read one alert's audit history in order.
 
@@ -64,11 +68,11 @@ spring.datasource.password=
 spring.jpa.hibernate.ddl-auto=validate
 ```
 
-The application uses H2 directly with no PostgreSQL compatibility or external-database settings. The database is created in the repository's working directory as `echo-payment-guard.mv.db` when the service first starts. Flyway runs `V1__create_payment_and_alert_tables.sql` to create the `payments`, `idempotency_keys`, and `alerts` tables and indexes. Hibernate validates the migrated schema instead of generating or modifying it. H2 files are excluded from Git.
+The application uses H2 directly with no PostgreSQL compatibility or external-database settings. The database is created in the repository's working directory as `echo-payment-guard.mv.db` when the service first starts. Flyway applies migrations V1–V4 for payments, idempotency keys, alerts, alert audit, processed stream events, and indexes. Hibernate validates the migrated schema instead of generating or modifying it. H2 files are excluded from Git.
 
 The database is persistent across service restarts. To start over, stop the service and remove the specific `echo-payment-guard.mv.db` file from the directory in which the service was launched; the next start recreates the schema. Do not remove the file while the service is running.
 
-The H2 connection is configured in `src/main/resources/application.properties`. No `.env` file or database credentials need to be configured; `.env.example` is included as a placeholder for later application settings.
+The H2 connection is configured in `src/main/resources/application.properties`. No `.env` file or database credentials need to be configured; `.env.example` is included as a placeholder.
 
 ## Run the application
 
@@ -173,6 +177,84 @@ npm run dev
 
 Open the Vite URL (normally `http://localhost:5173`). Vite proxies `/api` requests to `http://localhost:8080`. Create an alert using the changed-payload example above, then refresh the queue to view it and test Mark reviewed or Dismiss.
 
+### Task 3 verification checklist
+
+Run the frontend checks from `frontend/`:
+
+```powershell
+npm test
+npm run build
+```
+
+The React Testing Library test renders a mocked alert response, verifies that
+Dismiss sends `PATCH /api/alerts/{id}` with `status: "DISMISSED"`, and checks
+that a failed action displays an error. For a manual UI check, run the backend
+and frontend using the commands above, create an alert with the changed-payload
+example, and verify:
+
+- Type and status filters and Previous / Next pagination update the displayed
+  alerts.
+- Alert rows show masked accounts, amount with currency, and created time.
+- Mark reviewed and Dismiss send a note and `X-User` header; on success the
+  row status changes without a full-page reload.
+- `GET /api/alerts/<alert-id>/audit` shows the successful status change.
+
+The backend tests should verify that `OPEN` to `REVIEWED` or `DISMISSED` writes
+one audit row, and that a rejected transition returns `409` without writing an
+audit row. Run them with `.\mvnw.cmd -o test` from the repository root.
+
+## Kafka and Redis stream processing
+
+The stream path is disabled by default so the Task 1 application and offline tests do not require live Kafka or Redis. To enable it locally, start the broker services:
+
+```powershell
+docker compose up -d kafka redis
+```
+
+In the terminal used to start the backend, enable the stream listener:
+
+```powershell
+$env:PAYMENT_KAFKA_ENABLED = "true"
+.\mvnw.cmd spring-boot:run
+```
+
+The default endpoints are Kafka `localhost:9092` and Redis `localhost:6379`; override them with `KAFKA_BOOTSTRAP_SERVERS`, `REDIS_HOST`, and `REDIS_PORT`. Window settings are externalized in `src/main/resources/application.yml`:
+
+| Setting | Default | Meaning |
+|---|---:|---|
+| `PAYMENT_WINDOW` | `10m` | Sliding event-time window measured from `initiatedAt` |
+| `PAYMENT_RAPID_REPEAT_THRESHOLD` | `5` | Pair count that triggers one rapid-repeat alert |
+| `PAYMENT_EVENT_ID_RETENTION` | `90d` | Retention for processed event receipts |
+| `PAYMENT_KAFKA_RETRY_DELAY` | `1s` | Delay between malformed/failed message retries |
+
+Events are JSON objects with `eventId` plus the same payment fields as the REST request. They pass through `IntakeService`; the stream path does not implement a separate payment creation flow. A processed event receipt is stored in H2's `processed_payment_events` table and retained for 90 days. The cleanup job removes completed receipts past retention. Its `stream:<eventId>` idempotency key remains in `idempotency_keys` without expiry, so a very late redelivery still cannot create a second payment after the event receipt is removed. Processed receipts include a processing state so an interrupted event can resume its alert-window work.
+
+Redis stores sorted sets keyed by debtor/creditor pair and exact payment fingerprint. A single Lua script updates both sets, trims event-time scores, finds the nearest exact match inside the event-time window (preferring the latest earlier timestamp, while still detecting an out-of-order event), counts pair events, and claims the rapid-burst marker atomically. Keys receive a TTL on updates; the marker uses `SET NX` with expiry so a burst only triggers once. `NEAR_DUPLICATE` includes the new and matching payment IDs. `RAPID_REPEAT` fires when a pair reaches the configured threshold regardless of amount. Bad JSON or invalid events are retried twice after the initial attempt and then published to `payments.incoming.DLT`.
+
+### Generate, replay, and check a synthetic stream
+
+Python 3 is only needed for the utility scripts. The generator produces at least 10,000 unique synthetic events, repeats one `eventId`, seeds an exact near-duplicate pair, creates a seven-payment rapid burst with distinct amounts, writes malformed lines, and writes an alert manifest:
+
+```powershell
+python scripts/generate_stream.py --count 10000
+```
+
+With Docker Compose Kafka/Redis and the backend running with `PAYMENT_KAFKA_ENABLED=true`, publish the generated file and wait for every unique event in the run to complete:
+
+```powershell
+python scripts/replay_stream.py
+```
+
+The replay command prints unique events completed, elapsed end-to-end time, and measured events/second (completed event count divided by wall-clock time from producer start to final completion). The stream-status endpoint is used only for this measurement.
+
+Compare alerts to the generated manifest:
+
+```powershell
+python scripts/check_alerts.py
+```
+
+The checker prints expected and detected counts per seeded alert type plus unexpected and missing counts. A successful clean-database run should detect the manifest's `NEAR_DUPLICATE` and `RAPID_REPEAT` alerts with no unexpected alerts. No benchmark was run while implementing these changes; record the actual replay output here rather than treating an unmeasured number as a result.
+
 ## Tests
 
 Run the complete test suite without Docker or external services:
@@ -189,7 +271,7 @@ On macOS/Linux:
 
 `-o` forces Maven offline mode. If Maven has never downloaded the wrapper distribution or dependencies on this machine, run `.\mvnw.cmd test` once with network access, then use the offline command. Tests use an isolated in-memory H2 database in native H2 mode; they do not read/write the local file-backed application database.
 
-`PaymentIntakeTests` verifies:
+`PaymentIntakeTests` verifies the Task 1 H2 path:
 
 - First request returns `201` and one accepted payment.
 - Same-key, same-payload replay returns `200`, the original ID, `Idempotent-Replayed: true`, and no second payment.
@@ -197,8 +279,20 @@ On macOS/Linux:
 - Missing idempotency key and invalid amount return `400`.
 - Payment and alert API responses do not expose full synthetic account values; alert results contain masked values.
 - At least 20 concurrent requests with the same key create exactly one payment and all return the same ID.
-- Flyway creates the required three tables and the documented alert index.
+- Flyway creates the payment, idempotency, alert, audit, and processed-event tables and indexes.
+- Valid alert status transitions write an audit row; rejected transitions return `409` without writing one.
+- Stream-window unit and Kafka/Redis integration tests are not included yet.
+- Alert transitions allow `OPEN` to `REVIEWED`, append an audit record, and reject subsequent transitions with `409` without an extra audit entry.
 
-## Scope and next work
+Run the React UI tests from `frontend/`:
 
-The implemented scope is Task 1 plus the Task 3 investigator queue and audited review actions. Kafka/Redis replay detection, Docker Compose orchestration, and related integration/stream-generator tooling remain future work.
+```powershell
+cd frontend
+npm test
+```
+
+Kafka and Redis are optional services; the plain Maven test run is designed to work offline without them. The 10k stream replay requires Docker Compose and live Kafka/Redis.
+
+## Remaining work
+
+The React investigator queue and backend audited actions are implemented. The Kafka/Redis integration and stream generator are implemented; separate live-service integration tests for Kafka redelivery and DLT delivery remain to be added.
