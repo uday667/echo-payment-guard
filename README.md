@@ -1,5 +1,5 @@
 # Project Echo — Payment Guard
-
+![Alt text](image.png)
 This repository implements **Task 1**, the Kafka/Redis stream portion of **Task 2**, and the investigator-alert portion of **Task 3**. It provides database-enforced REST idempotency, Kafka event intake, Redis event-time duplicate detection, paginated/masked alerts, and audited alert status changes. H2 is the database for local runs; no external database application is needed.
 
 ## Requirements
