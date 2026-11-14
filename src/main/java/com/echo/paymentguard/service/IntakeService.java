@@ -6,9 +6,12 @@ import com.echo.paymentguard.dto.PaymentRequest;
 import com.echo.paymentguard.model.IdempotencyKey;
 import com.echo.paymentguard.model.Payment;
 import com.echo.paymentguard.model.PaymentAlert;
+import com.echo.paymentguard.model.ProcessedPaymentEvent;
 import com.echo.paymentguard.repository.IdempotencyKeyRepository;
 import com.echo.paymentguard.repository.PaymentAlertRepository;
 import com.echo.paymentguard.repository.PaymentRepository;
+import com.echo.paymentguard.repository.ProcessedPaymentEventRepository;
+import com.echo.paymentguard.util.PaymentFingerprint;
 
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
@@ -18,12 +21,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
@@ -33,20 +33,23 @@ public class IntakeService {
     private final PaymentRepository paymentRepository;
     private final IdempotencyKeyRepository idempotencyKeyRepository;
     private final PaymentAlertRepository alertRepository;
+    private final ProcessedPaymentEventRepository processedEventRepository;
     private final TransactionTemplate transactions;
 
     public IntakeService(PaymentRepository paymentRepository,
                          IdempotencyKeyRepository idempotencyKeyRepository,
                          PaymentAlertRepository alertRepository,
+                         ProcessedPaymentEventRepository processedEventRepository,
                          PlatformTransactionManager transactionManager) {
         this.paymentRepository = paymentRepository;
         this.idempotencyKeyRepository = idempotencyKeyRepository;
         this.alertRepository = alertRepository;
+        this.processedEventRepository = processedEventRepository;
         this.transactions = new TransactionTemplate(transactionManager);
     }
 
     public IntakeResult accept(String key, PaymentRequest request) {
-        String fingerprint = fingerprint(request);
+        String fingerprint = PaymentFingerprint.of(request);
         try {
             return transactions.execute(status -> createOrResolve(key, request, fingerprint));
         } catch (DataIntegrityViolationException conflict) {
@@ -54,6 +57,57 @@ public class IntakeService {
             if (resolved == null) throw conflict;
             return resolved;
         }
+    }
+
+    public EventIntakeResult acceptEvent(String eventId, PaymentRequest request) {
+        if (eventId == null || eventId.isBlank() || eventId.length() > 256) {
+            throw new IllegalArgumentException("eventId must contain 1 to 256 characters");
+        }
+        String fingerprint = PaymentFingerprint.of(request);
+        try {
+            return transactions.execute(status -> {
+                ProcessedPaymentEvent previous = processedEventRepository.findById(eventId).orElse(null);
+                if (previous != null && previous.getState().equals("COMPLETED")) {
+                    return new EventIntakeResult(previous.getPaymentId(), false, true);
+                }
+
+                IntakeResult intake = createOrResolve("stream:" + eventId, request, fingerprint);
+                if (intake.outcome() == Outcome.MISMATCH) {
+                    processedEventRepository.saveAndFlush(new ProcessedPaymentEvent(
+                            eventId, intake.paymentId(), "COMPLETED", Instant.now()));
+                    return new EventIntakeResult(intake.paymentId(), false, true);
+                }
+
+                ProcessedPaymentEvent event = previous == null
+                        ? new ProcessedPaymentEvent(eventId, intake.paymentId(), "PROCESSING", Instant.now())
+                        : previous;
+                event.setState("PROCESSING");
+                event.setProcessedAt(Instant.now());
+                processedEventRepository.saveAndFlush(event);
+                return new EventIntakeResult(intake.paymentId(),
+                        intake.outcome() == Outcome.CREATED, false);
+            });
+        } catch (DataIntegrityViolationException conflict) {
+            EventIntakeResult resolved = transactions.execute(status ->
+                    processedEventRepository.findById(eventId)
+                            .map(event -> new EventIntakeResult(
+                                    event.getPaymentId(),
+                                    false,
+                                    event.getState().equals("COMPLETED")))
+                            .orElse(null));
+            if (resolved == null) throw conflict;
+            return resolved;
+        }
+    }
+
+    public void completeEvent(String eventId) {
+        transactions.executeWithoutResult(status -> {
+            ProcessedPaymentEvent event = processedEventRepository.findById(eventId)
+                    .orElseThrow(() -> new IllegalStateException("Payment event reservation was not found"));
+            event.setState("COMPLETED");
+            event.setProcessedAt(Instant.now());
+            processedEventRepository.save(event);
+        });
     }
 
     private IntakeResult createOrResolve(String key, PaymentRequest request, String fingerprint) {
@@ -118,34 +172,11 @@ public class IntakeService {
         return new AlertPageResponse(content, page, size, result.getTotalElements());
     }
 
-    private String fingerprint(PaymentRequest request) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            update(digest, request.debtorAccount());
-            update(digest, request.creditorAccount());
-            update(digest, request.amount().stripTrailingZeros().toPlainString());
-            update(digest, request.currency().toUpperCase(Locale.ROOT));
-            update(digest, request.channel());
-            update(digest, request.reference());
-            update(digest, request.initiatedAt().toInstant().toString());
-            return HexFormat.of().formatHex(digest.digest());
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 is unavailable", e);
-        }
-    }
-
-    private void update(MessageDigest digest, String value) {
-        if (value == null) {
-            digest.update(ByteBuffer.allocate(Integer.BYTES).putInt(-1).array());
-            return;
-        }
-        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
-        digest.update(ByteBuffer.allocate(Integer.BYTES).putInt(bytes.length).array());
-        digest.update(bytes);
-    }
-
     public enum Outcome { CREATED, REPLAYED, MISMATCH }
 
     public record IntakeResult(UUID paymentId, Outcome outcome) {
+    }
+
+    public record EventIntakeResult(UUID paymentId, boolean newlyCreated, boolean alreadyCompleted) {
     }
 }

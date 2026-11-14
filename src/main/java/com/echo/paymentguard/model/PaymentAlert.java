@@ -27,6 +27,9 @@ public class PaymentAlert {
     @Column(name = "idempotency_key", unique = true)
     private String idempotencyKey;
 
+    @Column(name = "deduplication_key", unique = true)
+    private String deduplicationKey;
+
     @Column(name = "debtor_account", nullable = false)
     private String debtorAccount;
 
@@ -51,11 +54,19 @@ public class PaymentAlert {
     public PaymentAlert(UUID id, String type, String status, String paymentIds, String idempotencyKey,
                         String debtorAccount, String creditorAccount, BigDecimal amount,
                         String currency, String details, Instant createdAt) {
+        this(id, type, status, paymentIds, idempotencyKey, null, debtorAccount, creditorAccount,
+                amount, currency, details, createdAt);
+    }
+
+    public PaymentAlert(UUID id, String type, String status, String paymentIds, String idempotencyKey,
+                        String deduplicationKey, String debtorAccount, String creditorAccount,
+                        BigDecimal amount, String currency, String details, Instant createdAt) {
         this.id = id;
         this.type = type;
         this.status = status;
         this.paymentIds = paymentIds;
         this.idempotencyKey = idempotencyKey;
+        this.deduplicationKey = deduplicationKey;
         this.debtorAccount = debtorAccount;
         this.creditorAccount = creditorAccount;
         this.amount = amount;
@@ -68,6 +79,7 @@ public class PaymentAlert {
     public String getType() { return type; }
     public String getStatus() { return status; }
     public String getPaymentIds() { return paymentIds; }
+    public String getDeduplicationKey() { return deduplicationKey; }
     public String getDebtorAccount() { return debtorAccount; }
     public String getCreditorAccount() { return creditorAccount; }
     public BigDecimal getAmount() { return amount; }

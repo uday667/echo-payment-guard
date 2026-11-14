@@ -16,7 +16,9 @@ public record AlertResponse(UUID id, String type, String status, List<UUID> paym
                 alert.getId(),
                 alert.getType(),
                 alert.getStatus(),
-                List.of(UUID.fromString(alert.getPaymentIds())),
+                java.util.Arrays.stream(alert.getPaymentIds().split(","))
+                        .map(UUID::fromString)
+                        .toList(),
                 AccountMasker.mask(alert.getDebtorAccount()),
                 AccountMasker.mask(alert.getCreditorAccount()),
                 alert.getAmount(),

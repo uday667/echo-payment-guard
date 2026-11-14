@@ -14,6 +14,7 @@ import java.util.UUID;
 
 public interface PaymentAlertRepository extends JpaRepository<PaymentAlert, UUID> {
     boolean existsByIdempotencyKey(String idempotencyKey);
+    boolean existsByDeduplicationKey(String deduplicationKey);
 
     @Modifying
     @Transactional
