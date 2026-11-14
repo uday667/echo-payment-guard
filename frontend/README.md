@@ -1,32 +1,36 @@
-# React + TypeScript + Vite
+# Investigator alert queue
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+The React + TypeScript application lists alerts from `GET /api/alerts`, supports
+type and status filters with server-side pagination, and offers audited status
+actions for open alerts. Actions send `PATCH /api/alerts/{id}` with a status,
+an investigator note, and the `X-User: investigator` actor header.
 
-Currently, two official plugins are available:
+## Run locally
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+From the repository root, start the backend in one terminal:
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```powershell
+.\mvnw.cmd spring-boot:run
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+In another terminal, start the UI:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Open the URL printed by Vite (normally `http://localhost:5173`). The Vite
+development server proxies `/api` requests to `http://localhost:8080`.
+
+Run the frontend tests and production build from `frontend/`:
+
+```powershell
+npm test
+npm run build
+```
+
+This frontend does not start PostgreSQL, Redis, or Kafka, or run the Task 2
+stream replay. Those service and replay commands belong to the backend setup.
+The screen expects the backend to provide the alert PATCH endpoint.
