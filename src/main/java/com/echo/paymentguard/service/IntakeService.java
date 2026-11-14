@@ -27,9 +27,13 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
+import java.util.concurrent.locks.ReentrantLock;
 
 @Service
 public class IntakeService {
+    private static final int LOCK_STRIPES = 256;
+    private static final ReentrantLock[] KEY_LOCKS = createKeyLocks();
+
     private final PaymentRepository paymentRepository;
     private final IdempotencyKeyRepository idempotencyKeyRepository;
     private final PaymentAlertRepository alertRepository;
@@ -49,13 +53,19 @@ public class IntakeService {
     }
 
     public IntakeResult accept(String key, PaymentRequest request) {
-        String fingerprint = PaymentFingerprint.of(request);
+        ReentrantLock lock = lockFor("idempotency:" + key);
+        lock.lock();
         try {
-            return transactions.execute(status -> createOrResolve(key, request, fingerprint));
-        } catch (DataIntegrityViolationException conflict) {
-            IntakeResult resolved = transactions.execute(status -> resolveExisting(key, request, fingerprint));
-            if (resolved == null) throw conflict;
-            return resolved;
+            String fingerprint = PaymentFingerprint.of(request);
+            try {
+                return transactions.execute(status -> createOrResolve(key, request, fingerprint));
+            } catch (DataIntegrityViolationException conflict) {
+                IntakeResult resolved = transactions.execute(status -> resolveExisting(key, request, fingerprint));
+                if (resolved == null) throw conflict;
+                return resolved;
+            }
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -63,41 +73,57 @@ public class IntakeService {
         if (eventId == null || eventId.isBlank() || eventId.length() > 256) {
             throw new IllegalArgumentException("eventId must contain 1 to 256 characters");
         }
-        String fingerprint = PaymentFingerprint.of(request);
+        ReentrantLock lock = lockFor("event:" + eventId);
+        lock.lock();
         try {
-            return transactions.execute(status -> {
-                ProcessedPaymentEvent previous = processedEventRepository.findById(eventId).orElse(null);
-                if (previous != null && previous.getState().equals("COMPLETED")) {
-                    return new EventIntakeResult(previous.getPaymentId(), false, true);
-                }
+            String fingerprint = PaymentFingerprint.of(request);
+            try {
+                return transactions.execute(status -> {
+                    ProcessedPaymentEvent previous = processedEventRepository.findById(eventId).orElse(null);
+                    if (previous != null && previous.getState().equals("COMPLETED")) {
+                        return new EventIntakeResult(previous.getPaymentId(), false, true);
+                    }
 
-                IntakeResult intake = createOrResolve("stream:" + eventId, request, fingerprint);
-                if (intake.outcome() == Outcome.MISMATCH) {
-                    processedEventRepository.saveAndFlush(new ProcessedPaymentEvent(
-                            eventId, intake.paymentId(), "COMPLETED", Instant.now()));
-                    return new EventIntakeResult(intake.paymentId(), false, true);
-                }
+                    IntakeResult intake = createOrResolve("stream:" + eventId, request, fingerprint);
+                    if (intake.outcome() == Outcome.MISMATCH) {
+                        processedEventRepository.saveAndFlush(new ProcessedPaymentEvent(
+                                eventId, intake.paymentId(), "COMPLETED", Instant.now()));
+                        return new EventIntakeResult(intake.paymentId(), false, true);
+                    }
 
-                ProcessedPaymentEvent event = previous == null
-                        ? new ProcessedPaymentEvent(eventId, intake.paymentId(), "PROCESSING", Instant.now())
-                        : previous;
-                event.setState("PROCESSING");
-                event.setProcessedAt(Instant.now());
-                processedEventRepository.saveAndFlush(event);
-                return new EventIntakeResult(intake.paymentId(),
-                        intake.outcome() == Outcome.CREATED, false);
-            });
-        } catch (DataIntegrityViolationException conflict) {
-            EventIntakeResult resolved = transactions.execute(status ->
-                    processedEventRepository.findById(eventId)
-                            .map(event -> new EventIntakeResult(
-                                    event.getPaymentId(),
-                                    false,
-                                    event.getState().equals("COMPLETED")))
-                            .orElse(null));
-            if (resolved == null) throw conflict;
-            return resolved;
+                    ProcessedPaymentEvent event = previous == null
+                            ? new ProcessedPaymentEvent(eventId, intake.paymentId(), "PROCESSING", Instant.now())
+                            : previous;
+                    event.setState("PROCESSING");
+                    event.setProcessedAt(Instant.now());
+                    processedEventRepository.saveAndFlush(event);
+                    return new EventIntakeResult(intake.paymentId(),
+                            intake.outcome() == Outcome.CREATED, false);
+                });
+            } catch (DataIntegrityViolationException conflict) {
+                EventIntakeResult resolved = transactions.execute(status ->
+                        processedEventRepository.findById(eventId)
+                                .map(event -> new EventIntakeResult(
+                                        event.getPaymentId(),
+                                        false,
+                                        event.getState().equals("COMPLETED")))
+                                .orElse(null));
+                if (resolved == null) throw conflict;
+                return resolved;
+            }
+        } finally {
+            lock.unlock();
         }
+    }
+
+    private static ReentrantLock lockFor(String key) {
+        return KEY_LOCKS[(key.hashCode() & Integer.MAX_VALUE) % LOCK_STRIPES];
+    }
+
+    private static ReentrantLock[] createKeyLocks() {
+        ReentrantLock[] locks = new ReentrantLock[LOCK_STRIPES];
+        for (int i = 0; i < locks.length; i++) locks[i] = new ReentrantLock();
+        return locks;
     }
 
     public void completeEvent(String eventId) {
